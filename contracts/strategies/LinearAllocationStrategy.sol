@@ -1,7 +1,8 @@
+// LinearAllocationStrategy.sol
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./interfaces/IAllocationStrategy.sol";
+import "../interfaces/IAllocationStrategy.sol";
 
 /**
  * @title LinearAllocation

@@ -1,18 +1,18 @@
-// PrizeContract.sol
+// PrizeContractFHE.sol
 // SPDX-License-Identifier: MIT
 pragma solidity >=0.8.13 <0.9.0;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@fhenixprotocol/contracts/FHE.sol";
 import {Permissioned, Permission} from "@fhenixprotocol/contracts/access/Permissioned.sol";
-import {IAllocationStrategy} from "./interfaces/IAllocationStrategy.sol";
+import {IAllocationStrategyFHE} from "./interfaces/IAllocationStrategyFHE.sol";
 
-contract PrizeContract is AccessControl {
+contract PrizeContractFHE is AccessControl, Permissioned {
   struct Contribution {
     address contestant;
     string description;
-    uint256[] scores;
-    uint256 reward;
+    euint32[] scores;
+    euint32 reward;
     bool claimed;
   }
 
@@ -29,25 +29,25 @@ contract PrizeContract is AccessControl {
 
   address public organizer;
   string public description;
-  uint256 public monetaryRewardPool;
+  euint32 public monetaryRewardPool;
   State public state;
   string[] public criteriaNames;
-  uint256[] public criteriaWeights;
+  euint32[] public criteriaWeights;
   address[] public evaluators;
   mapping(address => Contribution) public contributions;
   address[] public contributionList;
 
-  IAllocationStrategy public strategy;
+  IAllocationStrategyFHE public strategy;
   uint256 public constant MAX_BATCH_SIZE = 100;
 
   event StateChanged(State oldState, State newState);
   event ContributionAdded(address contestant, string description);
   event ScoresAssigned(address[] contestants);
-  event RewardAllocated(address contestant, uint256 reward);
+  event RewardAllocated(address contestant);
   event EvaluatorAdded(address evaluator);
-  event PrizeFunded(address funder, uint256 amount);
+  event PrizeFunded(address funder);
   event PrizeCancelled();
-  event RewardClaimed(address contestant, uint256 amount);
+  event RewardClaimed(address contestant);
 
   modifier onlyOrganizer() {
     require(msg.sender == organizer, "Not authorized");
@@ -79,10 +79,15 @@ contract PrizeContract is AccessControl {
 
     organizer = _organizer;
     description = _description;
-    monetaryRewardPool = _totalRewardPool;
-    strategy = IAllocationStrategy(_strategy);
+    monetaryRewardPool = FHE.asEuint32(_totalRewardPool);
+    strategy = IAllocationStrategyFHE(_strategy);
     criteriaNames = _criteriaNames;
-    criteriaWeights = _criteriaWeights;
+
+    criteriaWeights = new euint32[](_criteriaWeights.length);
+    for (uint256 i = 0; i < _criteriaWeights.length; i++) {
+      criteriaWeights[i] = FHE.asEuint32(_criteriaWeights[i]);
+    }
+
     state = State.Setup;
     _grantRole(DEFAULT_ADMIN_ROLE, organizer);
   }
@@ -105,12 +110,12 @@ contract PrizeContract is AccessControl {
     }
   }
 
-  function fundPrize() public payable onlyOrganizer inState(State.Setup) {
-    require(
-      msg.value == monetaryRewardPool,
-      "Sent amount must equal total reward pool"
-    );
-    emit PrizeFunded(msg.sender, msg.value);
+  function fundPrize(
+    inEuint32 calldata _encryptedAmount
+  ) public onlyOrganizer inState(State.Setup) {
+    euint32 encryptedAmount = FHE.asEuint32(_encryptedAmount);
+    FHE.req(FHE.eq(encryptedAmount, monetaryRewardPool));
+    emit PrizeFunded(msg.sender);
   }
 
   function submitContribution(
@@ -129,9 +134,12 @@ contract PrizeContract is AccessControl {
 
   function assignScores(
     address[] calldata contestants,
-    uint256[][] calldata scores
+    inEuint32[][] calldata encryptedScores
   ) public onlyEvaluator inState(State.Evaluating) {
-    require(contestants.length == scores.length, "Mismatch in input arrays");
+    require(
+      contestants.length == encryptedScores.length,
+      "Mismatch in input arrays"
+    );
     require(contestants.length <= MAX_BATCH_SIZE, "Batch size exceeds maximum");
 
     for (uint256 i = 0; i < contestants.length; i++) {
@@ -140,12 +148,15 @@ contract PrizeContract is AccessControl {
         "Invalid contestant"
       );
       require(
-        scores[i].length == criteriaNames.length,
+        encryptedScores[i].length == criteriaNames.length,
         "Invalid number of scores"
       );
 
       Contribution storage contribution = contributions[contestants[i]];
-      contribution.scores = scores[i];
+      contribution.scores = new euint32[](encryptedScores[i].length);
+      for (uint256 j = 0; j < encryptedScores[i].length; j++) {
+        contribution.scores[j] = FHE.asEuint32(encryptedScores[i][j]);
+      }
     }
 
     emit ScoresAssigned(contestants);
@@ -162,26 +173,32 @@ contract PrizeContract is AccessControl {
     }
 
     address[] memory contestantsBatch = new address[](endIndex - startIndex);
-    uint256[] memory scoresBatch = new uint256[](endIndex - startIndex);
+    euint32[] memory scoresBatch = new euint32[](endIndex - startIndex);
 
     for (uint256 i = startIndex; i < endIndex; i++) {
       address contestant = contributionList[i];
       contestantsBatch[i - startIndex] = contestant;
-      // Calculate weighted sum of scores
-      uint256 weightedScore = 0;
+
+      euint32 weightedScore = FHE.asEuint32(0);
       for (uint256 j = 0; j < criteriaWeights.length; j++) {
-        weightedScore +=
-          contributions[contestant].scores[j] *
-          criteriaWeights[j];
+        weightedScore = FHE.add(
+          weightedScore,
+          FHE.mul(contributions[contestant].scores[j], criteriaWeights[j])
+        );
       }
       scoresBatch[i - startIndex] = weightedScore;
     }
 
-    // Calculate the portion of the reward pool for this batch
-    uint256 batchRewardPool = (monetaryRewardPool * (endIndex - startIndex)) /
-      contributionList.length;
+    euint32 batchRewardPool = FHE.mul(
+      monetaryRewardPool,
+      FHE.asEuint32(endIndex - startIndex)
+    );
+    batchRewardPool = FHE.div(
+      batchRewardPool,
+      FHE.asEuint32(contributionList.length)
+    );
 
-    uint256[] memory rewardsBatch = strategy.computeAndAllocate(
+    euint32[] memory rewardsBatch = strategy.computeAndAllocate(
       contestantsBatch,
       batchRewardPool,
       scoresBatch
@@ -189,28 +206,29 @@ contract PrizeContract is AccessControl {
 
     for (uint256 i = startIndex; i < endIndex; i++) {
       contributions[contributionList[i]].reward = rewardsBatch[i - startIndex];
-      emit RewardAllocated(contributionList[i], rewardsBatch[i - startIndex]);
+      emit RewardAllocated(contributionList[i]);
     }
   }
 
-  function claimReward() public inState(State.Closed) {
+  function claimReward(
+    Permission calldata permission
+  ) public inState(State.Closed) onlyPermitted(permission, msg.sender) {
     Contribution storage contribution = contributions[msg.sender];
     require(contribution.contestant != address(0), "No contribution found");
     require(!contribution.claimed, "Reward already claimed");
-    require(contribution.reward > 0, "No reward available");
-    require(
-      address(this).balance >= contribution.reward,
-      "Insufficient contract balance"
-    );
+
+    ebool hasReward = FHE.gt(contribution.reward, FHE.asEuint32(0));
+    FHE.req(hasReward);
 
     contribution.claimed = true;
-    uint256 reward = contribution.reward;
-    contribution.reward = 0;
+    euint32 reward = contribution.reward;
+    contribution.reward = FHE.asEuint32(0);
 
-    (bool success, ) = msg.sender.call{value: reward}("");
+    uint256 plainReward = FHE.decrypt(reward);
+    (bool success, ) = msg.sender.call{value: plainReward}("");
     require(success, "Transfer failed");
 
-    emit RewardClaimed(msg.sender, reward);
+    emit RewardClaimed(msg.sender);
   }
 
   function cancelPrize() public onlyOrganizer {
@@ -222,7 +240,14 @@ contract PrizeContract is AccessControl {
     emit PrizeCancelled();
   }
 
-  function withdrawFunds() public onlyOrganizer inState(State.Cancelled) {
+  function withdrawFunds(
+    Permission calldata permission
+  )
+    public
+    onlyOrganizer
+    inState(State.Cancelled)
+    onlyPermitted(permission, msg.sender)
+  {
     uint256 balance = address(this).balance;
     require(balance > 0, "No funds to withdraw");
     (bool success, ) = organizer.call{value: balance}("");
@@ -232,10 +257,11 @@ contract PrizeContract is AccessControl {
   function moveToNextState() public onlyOrganizer {
     require(uint(state) < uint(State.Closed), "Cannot move to next state");
     if (state == State.Setup) {
-      require(
-        address(this).balance >= monetaryRewardPool,
-        "Contract not fully funded"
+      ebool isFunded = FHE.gte(
+        FHE.asEuint32(address(this).balance),
+        monetaryRewardPool
       );
+      FHE.req(isFunded);
     }
     if (state == State.Evaluating) {
       require(
@@ -254,7 +280,11 @@ contract PrizeContract is AccessControl {
 
   function allRewardsAllocated() internal view returns (bool) {
     for (uint256 i = 0; i < contributionList.length; i++) {
-      if (contributions[contributionList[i]].reward == 0) {
+      ebool hasReward = FHE.gt(
+        contributions[contributionList[i]].reward,
+        FHE.asEuint32(0)
+      );
+      if (!FHE.decrypt(hasReward)) {
         return false;
       }
     }
@@ -274,5 +304,21 @@ contract PrizeContract is AccessControl {
     State oldState = state;
     state = newState;
     emit StateChanged(oldState, newState);
+  }
+
+  function getSealedReward(
+    Permission calldata permission,
+    bytes32 publicKey
+  )
+    public
+    view
+    inState(State.Closed)
+    onlyPermitted(permission, msg.sender)
+    returns (bytes memory)
+  {
+    Contribution storage contribution = contributions[msg.sender];
+    require(contribution.contestant != address(0), "No contribution found");
+    string memory sealedString = FHE.sealoutput(contribution.reward, publicKey);
+    return bytes(sealedString);
   }
 }
